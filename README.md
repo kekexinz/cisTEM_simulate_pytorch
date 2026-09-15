@@ -1,7 +1,7 @@
 # cisTEM_simulate_pytorch
 
 A pytorch version of cisTEM simulate. Great thanks to ChatGPT! The original version can be found at:  
-https://github.com/timothygrant80/cisTEM
+https://github.com/timothygrant80/cisTEM . Original citation: https://journals.iucr.org/m/issues/2021/06/00/rq5007/index.html
 
 ## Required libraries
 
