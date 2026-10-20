@@ -313,13 +313,26 @@ def _protein_coordinate_fingerprint(atoms: Sequence[Atom]) -> Tuple[str, np.ndar
 
 def _hydration_atlas_cache_key(atoms: Sequence[Atom], cfg: SimConfig, device: torch.device) -> Tuple:
     digest, coords = _protein_coordinate_fingerprint(atoms)
-    return (str(device), digest, int(coords.shape[0]), float(cfg.pixel_size), float(cfg.water_soft_atlas_spacing_a), float(cfg.water_soft_atlas_cutoff_a))
+    return (str(device), digest, int(coords.shape[0]), float(cfg.pixel_size), float(cfg.water_soft_atlas_spacing_a), float(cfg.water_soft_atlas_cutoff_a),
+            bool(getattr(cfg, 'cistem_hydration_neighborhood', False)), float(cfg.min_bfactor), float(cfg.bfactor_scaling))
 
 def build_hydration_atlas(atoms: Sequence[Atom], cfg: SimConfig, device: torch.device) -> HydrationAtlas:
     if not hasattr(torch.Tensor, 'scatter_reduce_'):
         raise RuntimeError('This hydration-atlas implementation requires torch.Tensor.scatter_reduce_().')
     spacing = float(cfg.water_soft_atlas_spacing_a)
     cutoff = float(cfg.water_soft_atlas_cutoff_a)
+    cistem_cube = bool(getattr(cfg, 'cistem_hydration_neighborhood', False))
+    if cistem_cube:
+        # simulate.cpp records a voxel's distance to the protein only inside each atom's neighbourhood cube of
+        # +-size_neighborhood voxels, size_neighborhood = 1 + round((0.4 sqrt(0.6 B) + 0.2) / pixel), with B the
+        # mean atom B-factor; every other water keeps weight 1. So cisTEM applies the exclusion and the shell
+        # peak of the hydration curve but not its dip beyond the cube. Grid spacing = pixel size, as in cisTEM.
+        spacing = float(cfg.pixel_size)
+        # cisTEM: BF = return_bfactor(average_bFactor + min_bFactor), return_bfactor(b) = min_bFactor + b * bFactor_scaling
+        pdb_mean_b = float(np.mean([float(a.bfactor) for a in atoms]))
+        mean_b = float(cfg.min_bfactor) + (pdb_mean_b + float(cfg.min_bfactor)) * float(cfg.bfactor_scaling)
+        n_cube = 1 + int(round((0.4 * math.sqrt(0.6 * mean_b) + 0.2) / spacing))
+        cutoff = (n_cube + 0.5) * spacing * math.sqrt(3.0)
     if not math.isfinite(spacing) or spacing <= 0.0:
         raise ValueError('water_soft_atlas_spacing_a must be finite and > 0')
     if not math.isfinite(cutoff) or cutoff <= 0.0:
@@ -345,7 +358,10 @@ def build_hydration_atlas(atoms: Sequence[Atom], cfg: SimConfig, device: torch.d
     oz, oy, ox = torch.meshgrid(axis, axis, axis, indexing='ij')
     offsets = torch.stack((ox, oy, oz), dim=-1).reshape(-1, 3)
     offset_limit = cutoff + math.sqrt(3.0) * 0.5 * spacing + 1e-06
-    offsets = offsets[offsets.to(torch.float32).square().sum(dim=1).sqrt() * spacing <= offset_limit]
+    if cistem_cube:
+        offsets = offsets[offsets.abs().max(dim=1).values <= n_cube]
+    else:
+        offsets = offsets[offsets.to(torch.float32).square().sum(dim=1).sqrt() * spacing <= offset_limit]
     chunk_size = max(1, int(cfg.water_soft_atlas_atom_chunk_size))
     cutoff2 = cutoff * cutoff
     for start in range(0, int(atom_xyz.shape[0]), chunk_size):
@@ -355,7 +371,8 @@ def build_hydration_atlas(atoms: Sequence[Atom], cfg: SimConfig, device: torch.d
         valid = (grid_index[..., 0] >= 0) & (grid_index[..., 0] < nx) & (grid_index[..., 1] >= 0) & (grid_index[..., 1] < ny) & (grid_index[..., 2] >= 0) & (grid_index[..., 2] < nz)
         grid_xyz = origin[None, None, :] + grid_index.to(torch.float32) * spacing
         d2 = (grid_xyz - atom_chunk[:, None, :]).square().sum(dim=-1)
-        valid &= d2 <= cutoff2
+        if not cistem_cube:
+            valid &= d2 <= cutoff2
         if valid.any():
             selected = grid_index[valid]
             flat = selected[:, 2] * (ny * nx) + selected[:, 1] * nx + selected[:, 0]
@@ -531,6 +548,7 @@ class SimConfig:
     dose_rate_e_per_px_s: float = 3.0
     absolute_intensity: bool = False
     cistem_dqe: bool = False
+    cistem_hydration_neighborhood: bool = False
 
 def electron_wavelength_angstrom(kv: float) -> float:
     return 1226.39 / math.sqrt(kv * 1000.0 + 9.7845e-07 * (kv * 1000.0) ** 2) * 0.01
@@ -3292,11 +3310,14 @@ def parse_args(argv: Optional[Iterable[str]]=None) -> argparse.Namespace:
     parser.add_argument('--use-hydrogen', action='store_true')
     parser.add_argument('--cistem-parity', action='store_true',
                         help='Match cisTEM simulate: coherence envelopes, absolute intensity (thickness attenuation kept), '
-                             "cisTEM's DQE filter, HETATM excluded unless --use-hetatm")
+                             "cisTEM's DQE filter, cisTEM's hydration weighting (soft weight in its neighbourhood cube, "
+                             "no hard water exclusion), HETATM excluded unless --use-hetatm")
     parser.add_argument('--use-hetatm', action='store_true', help='With --cistem-parity: include HETATM records (opt-in, as in newer cisTEM)')
     parser.add_argument('--coherence-envelope', action='store_true', help="Apply cisTEM's spatial/temporal coherence envelopes to the lens")
     parser.add_argument('--dose-rate', type=float, default=3.0, help='e-/px/s, sets the spatial coherence envelope (cisTEM default 3.0)')
     parser.add_argument('--absolute-intensity', action='store_true', help='Keep absolute counts (no renormalisation to the incident dose)')
+    parser.add_argument('--cistem-hydration-neighborhood', action='store_true',
+                        help="With --water-soft-weight: apply the hydration curve only within cisTEM's per-atom neighbourhood cube (exclusion + shell peak, no dip)")
     parser.add_argument('--cistem-dqe', action='store_true', help="With --dqe: cisTEM's DQE filter (K2 fit in 1/px, whole spectrum incl. the mean); needs --absolute-intensity")
     parser.add_argument('--no-center', action='store_true')
     parser.add_argument('--rot', type=float, default=0.0)
@@ -3364,7 +3385,11 @@ def main(argv: Optional[Iterable[str]]=None) -> None:
                   coherence_envelope=parity or bool(args.coherence_envelope),
                   dose_rate_e_per_px_s=float(args.dose_rate),
                   absolute_intensity=parity or bool(args.absolute_intensity),
-                  cistem_dqe=parity or bool(args.cistem_dqe))
+                  cistem_dqe=parity or bool(args.cistem_dqe),
+                  cistem_hydration_neighborhood=parity or bool(args.cistem_hydration_neighborhood),
+                  # cisTEM weights waters by the hydration curve and never removes them
+                  water_soft_weight=True if parity else cfg.water_soft_weight,
+                  water_exclude_below_a=0.0 if parity else cfg.water_exclude_below_a)
     run(cfg, args.pdb, args.output)
 if __name__ == '__main__':
     main()
