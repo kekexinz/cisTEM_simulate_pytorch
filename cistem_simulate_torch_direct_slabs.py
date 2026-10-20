@@ -555,6 +555,8 @@ class SimConfig:
     phase_plate_defocus_a: float = 0.0
     phase_plate_cut_on_a: Optional[float] = None
     phase_plate_dqe: bool = True
+    phase_plate_cs_mm: Optional[float] = None
+    water_shake_rms_a: Optional[float] = None
 
 def electron_wavelength_angstrom(kv: float) -> float:
     return 1226.39 / math.sqrt(kv * 1000.0 + 9.7845e-07 * (kv * 1000.0) ** 2) * 0.01
@@ -2418,7 +2420,12 @@ def shake_waters_3d_torch_inplace(water_cache: TorchWaterCache, cfg: SimConfig, 
     coords = water_cache.water_coords
     if coords.numel() == 0:
         return coords
-    sigma_a = 1.5 * float(dose_per_frame_e_per_a2) * float(cfg.pixel_size)
+    rms = getattr(cfg, 'water_shake_rms_a', None)
+    if rms is None:
+        sigma_a = 1.5 * float(dose_per_frame_e_per_a2) * float(cfg.pixel_size)  # cisTEM: 1.5 px per axis per e-/A^2
+    else:
+        # rms 3D displacement of rms A per e-/A^2 per frame step (McMullan & Henderson ~1 A), split over 3 axes
+        sigma_a = float(rms) * float(dose_per_frame_e_per_a2) / math.sqrt(3.0)
     if sigma_a != 0.0:
         kwargs = dict(device=coords.device, dtype=coords.dtype)
         noise = torch.randn(coords.shape, generator=water_cache.generator, **kwargs) if water_cache.generator is not None else torch.randn(coords.shape, **kwargs)
@@ -3185,8 +3192,10 @@ def propagate_slabs_cistem_like_torch(phase_slabs, amp_slabs, dz_list, cfg: SimC
 def phase_plate_config(cfg: SimConfig) -> SimConfig:
     """Lens for the paired phase-plate image: Zernike shift, defocus at the scattering centre, no shot noise."""
     d = float(getattr(cfg, 'phase_plate_defocus_a', 0.0))
+    pp_cs = getattr(cfg, 'phase_plate_cs_mm', None)
     pp = replace(cfg, defocus_u=d, defocus_v=None, defocus_angle_deg=0.0, phase_shift_rad=0.0, poisson=False,
-                 dqe=bool(cfg.dqe) and bool(getattr(cfg, 'phase_plate_dqe', True)))
+                 dqe=bool(cfg.dqe) and bool(getattr(cfg, 'phase_plate_dqe', True)),
+                 cs_mm=float(cfg.cs_mm) if pp_cs is None else float(pp_cs))
     pp.zernike_phase_shift_rad = float(getattr(cfg, 'phase_plate_shift_rad', 0.5 * math.pi))
     pp.zernike_cut_on_a = getattr(cfg, 'phase_plate_cut_on_a', None)
     return pp
@@ -3436,6 +3445,9 @@ def parse_args(argv: Optional[Iterable[str]]=None) -> argparse.Namespace:
     parser.add_argument('--phase-plate-defocus', type=float, default=0.0, help='defocus of the phase-plate image, Angstrom, at the scattering centre')
     parser.add_argument('--phase-plate-cut-on', type=float, default=None, help='cut-on of the phase plate, Angstrom (default: only the central beam)')
     parser.add_argument('--phase-plate-no-dqe', action='store_true', help='phase-plate image without the detector DQE filter')
+    parser.add_argument('--phase-plate-cs', type=float, default=None, help='Cs (mm) of the phase-plate lens; 0 = Cs-corrected (default: --cs)')
+    parser.add_argument('--water-shake-rms', type=float, default=None,
+                        help='rms 3D water displacement in A per e-/A^2 per frame (e.g. 1.0, McMullan & Henderson); default cisTEM 1.5 px per axis')
     parser.add_argument('--cistem-dqe', action='store_true', help="With --dqe: cisTEM's DQE filter (K2 fit in 1/px, whole spectrum incl. the mean); needs --absolute-intensity")
     parser.add_argument('--no-center', action='store_true')
     parser.add_argument('--rot', type=float, default=0.0)
@@ -3511,6 +3523,8 @@ def main(argv: Optional[Iterable[str]]=None) -> None:
                   phase_plate_defocus_a=float(args.phase_plate_defocus),
                   phase_plate_cut_on_a=args.phase_plate_cut_on,
                   phase_plate_dqe=not bool(args.phase_plate_no_dqe),
+                  phase_plate_cs_mm=args.phase_plate_cs,
+                  water_shake_rms_a=args.water_shake_rms,
                   # cisTEM weights waters by the hydration curve and never removes them
                   water_soft_weight=True if parity else cfg.water_soft_weight,
                   water_exclude_below_a=0.0 if parity else cfg.water_exclude_below_a)
