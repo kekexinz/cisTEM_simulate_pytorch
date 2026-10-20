@@ -525,6 +525,12 @@ class SimConfig:
     disable_cistem_defocus_offset: bool = False
     timing: bool = False
     timing_json: Optional[str] = None
+    # cisTEM-parity options (see --cistem-parity). Defaults keep the original behaviour.
+    use_hetatm: bool = True
+    coherence_envelope: bool = False
+    dose_rate_e_per_px_s: float = 3.0
+    absolute_intensity: bool = False
+    cistem_dqe: bool = False
 
 def electron_wavelength_angstrom(kv: float) -> float:
     return 1226.39 / math.sqrt(kv * 1000.0 + 9.7845e-07 * (kv * 1000.0) ** 2) * 0.01
@@ -2706,6 +2712,24 @@ def finalize_detector_image_torch(img: torch.Tensor, cfg: SimConfig) -> torch.Te
     with timing_section(cfg, 'detector_finalize'):
         out = img.to(torch.float32)
         spatial_dims = (-2, -1)
+        if bool(getattr(cfg, 'absolute_intensity', False)):
+            # cisTEM: the incident wave has |psi|^2 = dose_per_frame * pixel_size^2, so the intensity keeps every
+            # loss (inelastic absorption, aperture); the DQE filter multiplies the whole spectrum including the
+            # mean; Poisson is drawn from those absolute counts, never renormalised to the incident dose.
+            out = out * (float(cfg.dose_e_per_a2) * float(cfg.pixel_size) ** 2)
+            if cfg.dqe and bool(getattr(cfg, 'cistem_dqe', False)):
+                out = apply_fourier_filter_real_rfft_torch(out, cistem_dqe_filter_rfft_torch(tuple(out.shape[-2:]), out.device))
+            elif cfg.dqe:
+                mean = out.mean(dim=spatial_dims, keepdim=True)
+                filt = dqe_filter_rfft_torch(tuple(out.shape[-2:]), cfg.pixel_size, out.device, root=True, cfg=cfg)
+                out = mean + apply_fourier_filter_real_rfft_torch(out - mean, filt)
+            if cfg.poisson:
+                if cfg.seed is not None:
+                    torch.manual_seed(int(cfg.seed))
+                    if out.device.type == 'cuda':
+                        torch.cuda.manual_seed_all(int(cfg.seed))
+                out = torch.poisson(torch.clamp(out, min=0.0)).to(torch.float32)
+            return out
         if cfg.dqe:
             mean = out.mean(dim=spatial_dims, keepdim=True)
             contrast = out - mean
@@ -2721,6 +2745,30 @@ def finalize_detector_image_torch(img: torch.Tensor, cfg: SimConfig) -> torch.Te
             norm_intensity = out / (mean + 1e-12)
             out = torch.poisson(torch.clamp(norm_intensity * electrons_per_pixel, min=0.0)).to(torch.float32)
         return out
+
+_CISTEM_DQE_FILTERS: Dict[Tuple, torch.Tensor] = {}
+
+
+def cistem_dqe_filter_rfft_torch(shape: Tuple[int, int], device: torch.device) -> torch.Tensor:
+    """simulate.cpp apply_sqrt_DQE_or_NTF: 5-Gaussian K2 fit (Ruskin et al., 300 kV, 2.5 e-/px/s), used as-is.
+
+    Frequency in reciprocal pixels and Gaussians exp(-((f - B) / C)^2), as in cisTEM; no normalisation or
+    square root. Applied to the full spectrum, so the mean is scaled too (0.795 at f = 0), as in cisTEM.
+    """
+    key = (int(shape[0]), int(shape[1]), str(device))
+    cached = _CISTEM_DQE_FILTERS.get(key)
+    if cached is not None:
+        return cached
+    fy = torch.fft.fftfreq(int(shape[0]), d=1.0, device=device)
+    fx = torch.fft.rfftfreq(int(shape[1]), d=1.0, device=device)
+    ky, kx = torch.meshgrid(fy, fx, indexing='ij')
+    freq = torch.sqrt(kx * kx + ky * ky)
+    out = torch.zeros_like(freq, dtype=torch.float32)
+    for a, b, c in zip(DQE_A, DQE_B, DQE_C):
+        out.add_(float(a) * torch.exp(-((freq - float(b)) / float(c)) ** 2))
+    _CISTEM_DQE_FILTERS[key] = out
+    return out
+
 
 def simulate_projection_from_slab_stack_batch_torch(phase_stack: torch.Tensor, cfg: SimConfig) -> torch.Tensor:
     squeeze = False
@@ -2918,7 +2966,50 @@ def cistem_complex_transfer_full_batch_torch(shape: Tuple[int, int], cfg: SimCon
     chi = math.pi * lam * defocus * k2[None, :, :] - 0.5 * math.pi * cs_a * lam ** 3 * k2[None, :, :] ** 2 + float(cfg.phase_shift_rad)
     h_real = -torch.cos(chi)
     h_imag = -torch.sin(chi)
+    if bool(getattr(cfg, 'coherence_envelope', False)):
+        env = cistem_coherence_envelope_torch(k2, cfg, 0.5 * (du + dv))
+        h_real = h_real * env
+        h_imag = h_imag * env
     return torch.complex(h_real.to(torch.float32), h_imag.to(torch.float32)).to(torch.complex64)
+
+
+# cisTEM src/core/defines.h
+_CISTEM_RELATIVISTIC_VOLTAGE = {100: 109784.0, 200: 239139.0, 300: 388062.0}
+_CISTEM_LORENTZ_FACTOR = {100: 1.196, 200: 1.391, 300: 1.587}
+_CISTEM_ELECTRON_REST_MASS_EV = 510998.0
+
+
+def cistem_coherence_envelope_torch(k2: torch.Tensor, cfg: SimConfig, defocus_a: torch.Tensor) -> torch.Tensor:
+    """Spatial + temporal coherence envelope of cisTEM's CTF (CTF::SetEnvelope and CTF::EvaluateWithEnvelope).
+
+    simulate.cpp applies it to the objective-lens transfer through Image::ApplyCTF(..., apply_envelope=true).
+    Everything is evaluated in cisTEM's pixel units (frequency in 1/px, lengths in px), including its unit
+    conventions for the energy half width, so the numbers match cisTEM exactly. Energy spread 1.1 eV and beam
+    brightness 12e7 are cisTEM's hard-coded Krios/XFEG values; dose rate is in e-/px/s as asked by simulate.
+    defocus_a: [B] mean defocus in Angstrom, after the scattering-centre offset (as in ctf[0]/ctf[1]).
+    """
+    kv = int(round(float(cfg.kv)))
+    if kv not in _CISTEM_RELATIVISTIC_VOLTAGE:
+        raise ValueError(f'cisTEM coherence envelope is defined for 100, 200 and 300 kV only, not {cfg.kv}')
+    px = float(cfg.pixel_size)
+    lam_px = electron_wavelength_angstrom(float(cfg.kv)) / px
+    cs_px = float(cfg.cs_mm) * 1.0e7 / px
+    k2_px = (k2 * (px * px))[None, :, :]
+    df_px = (defocus_a / px)[:, None, None]
+    dose_rate_per_a2 = float(cfg.dose_rate_e_per_px_s) / (px * px)
+    energy_spread_ev = 1.1
+    beam_brightness = 12e7
+    sq_illum = 16000.0 * dose_rate_per_a2 / (math.pi * beam_brightness) / _CISTEM_RELATIVISTIC_VOLTAGE[kv]
+    lorentz = _CISTEM_LORENTZ_FACTOR[kv]
+    cs_si = cs_px / 1e10 * px
+    cc = cs_si * lorentz
+    if cs_si < 1e-6:  # aberration corrector adds 0.4 mm (cisTEM)
+        cc += 2.52 * lorentz
+    sq_e = (1 + lorentz) / (1 + 0.5 * lorentz) * cc * energy_spread_ev / (_CISTEM_ELECTRON_REST_MASS_EV + _CISTEM_RELATIVISTIC_VOLTAGE[kv])
+    sq_e = (sq_e / px) ** 2 / math.log(16.0)
+    sq_illum = sq_illum / math.log(16.0)
+    common = -(math.pi ** 2) * k2_px / (2.0 * (1.0 + 2.0 * math.pi ** 2 * sq_illum * k2_px * sq_e))
+    return torch.exp(common * (lam_px ** 2 * sq_e * k2_px + 2.0 * sq_illum * (cs_px * lam_px ** 2 * k2_px - df_px) ** 2)).to(torch.float32)
 
 def cistem_objective_aperture_mask_full_torch(shape: Tuple[int, int], cfg: SimConfig, device: torch.device) -> torch.Tensor:
     """Approximate WaveFunctionPropagator's objective aperture cosine mask."""
@@ -3085,7 +3176,7 @@ def run(cfg: SimConfig, pdb_path: str | Path, output_path: str | Path) -> np.nda
     recorder.start()
     try:
         with timing_section(cfg, 'pdb_read_and_center'):
-            protein_frame_atoms = read_pdb_atoms(pdb_path, use_hydrogen=cfg.use_hydrogen)
+            protein_frame_atoms = read_pdb_atoms(pdb_path, use_hydrogen=cfg.use_hydrogen, allow_hetatm=cfg.use_hetatm)
             if cfg.center_by_mass:
                 center_atoms(protein_frame_atoms)
         recorder.set_counter('protein_atom_count', len(protein_frame_atoms))
@@ -3199,6 +3290,14 @@ def parse_args(argv: Optional[Iterable[str]]=None) -> argparse.Namespace:
     parser.add_argument('--bfactor-scaling', type=float, default=0.0)
     parser.add_argument('--bond-scaling', type=float, default=BOND_SCALING_DEFAULT)
     parser.add_argument('--use-hydrogen', action='store_true')
+    parser.add_argument('--cistem-parity', action='store_true',
+                        help='Match cisTEM simulate: coherence envelopes, absolute intensity (thickness attenuation kept), '
+                             "cisTEM's DQE filter, HETATM excluded unless --use-hetatm")
+    parser.add_argument('--use-hetatm', action='store_true', help='With --cistem-parity: include HETATM records (opt-in, as in newer cisTEM)')
+    parser.add_argument('--coherence-envelope', action='store_true', help="Apply cisTEM's spatial/temporal coherence envelopes to the lens")
+    parser.add_argument('--dose-rate', type=float, default=3.0, help='e-/px/s, sets the spatial coherence envelope (cisTEM default 3.0)')
+    parser.add_argument('--absolute-intensity', action='store_true', help='Keep absolute counts (no renormalisation to the incident dose)')
+    parser.add_argument('--cistem-dqe', action='store_true', help="With --dqe: cisTEM's DQE filter (K2 fit in 1/px, whole spectrum incl. the mean); needs --absolute-intensity")
     parser.add_argument('--no-center', action='store_true')
     parser.add_argument('--rot', type=float, default=0.0)
     parser.add_argument('--tilt', type=float, default=0.0)
@@ -3259,6 +3358,13 @@ def parse_args(argv: Optional[Iterable[str]]=None) -> argparse.Namespace:
 def main(argv: Optional[Iterable[str]]=None) -> None:
     args = parse_args(argv)
     cfg = SimConfig(box=args.box, pixel_size=args.pixel_size, kv=args.kv, cs_mm=args.cs, defocus_u=args.defocus, defocus_v=args.defocus_v, defocus_angle_deg=args.defocus_angle, amplitude_contrast=args.amplitude_contrast, phase_shift_rad=args.phase_shift, dose_e_per_a2=args.dose, n_slices=args.n_slices, ice_thickness_a=args.ice_thickness, ice_protein_position=args.ice_protein_position, ice_surface_clearance_a=args.ice_surface_clearance, inelastic_potential=bool(args.inelastic_potential), min_bfactor=args.min_bfactor, bfactor_scaling=args.bfactor_scaling, bond_scaling=args.bond_scaling, center_by_mass=not args.no_center, euler_rot_deg=args.rot, euler_tilt_deg=args.tilt, euler_psi_deg=args.psi, euler_inverse=args.euler_inverse, use_hydrogen=args.use_hydrogen, explicit_water=args.explicit_water, water_density_scale=args.water_density_scale, water_max_count=args.water_max_count, water_template_radius_pix=args.water_template_radius_pix, water_subpix_n=args.water_subpix_n, water_exclude_below_a=args.water_exclude_below, water_soft_weight=args.water_soft_weight, water_soft_atlas_spacing_a=args.water_soft_atlas_spacing, water_soft_atlas_cutoff_a=args.water_soft_atlas_cutoff, water_soft_atlas_atom_chunk_size=max(1, int(args.water_soft_atlas_atom_chunk_size)), water_soft_atlas_cache_entries=max(1, int(args.water_soft_atlas_cache_entries)), water_bfactor=args.water_bfactor, mode=args.mode, poisson=args.poisson, dqe=args.dqe, seed=args.seed, verbose=args.verbose, radiation_damage=args.radiation_damage, radiation_damage_where=args.radiation_damage_where, pre_exposure_e_per_a2=args.pre_exposure, exposure_filter_modify_signal=args.exposure_filter_modify_signal, per_frame=args.per_frame, number_of_frames=args.number_of_frames, dose_per_frame_e_per_a2=args.dose_per_frame, save_frames=args.save_frames, normalize_frame_sum=not args.no_normalize_frame_sum, shake_waters=args.shake_waters, use_cache_atom=args.use_cache_atom, device=args.device, solvent_padding_pix=args.solvent_padding_pix, edge_taper_width_pix=args.edge_taper_width_pix, sampled_mask_erode_pix=args.sampled_mask_erode_pix, sampled_mask_lowpass=args.sampled_mask_lowpass, disable_cistem_edge_pipeline=args.disable_cistem_edge_pipeline, frame_batch_size=max(1, int(args.frame_batch_size)), water_template_chunk_size=max(1, int(args.water_template_chunk_size)), water_slab_chunk_size=int(args.water_slab_chunk_size), water_seed_z_chunk=max(1, int(args.water_seed_z_chunk)), water_seed_max_octants_per_chunk=max(8, int(args.water_seed_max_octants_per_chunk)), water_filter_chunk_size=max(1, int(args.water_filter_chunk_size)), water_filter_cell_size_a=args.water_filter_cell_size, atom_cache_subpix_n=max(1, int(args.atom_cache_subpix_n)), atom_cache_radius_pix=max(1, int(args.atom_cache_radius_pix)), atom_template_chunk_size=max(1, int(args.atom_template_chunk_size)), protein_tensor_cache_entries=max(1, int(args.protein_tensor_cache_entries)), objective_aperture_diameter_micron=float(args.objective_aperture), objective_aperture_falloff_pix=float(args.objective_aperture_falloff_pix), disable_cistem_inelastic_filter=bool(args.disable_cistem_inelastic_filter), disable_cistem_defocus_offset=bool(args.disable_cistem_defocus_offset), timing=bool(args.timing or args.timing_json), timing_json=args.timing_json)
+    parity = bool(args.cistem_parity)
+    cfg = replace(cfg,
+                  use_hetatm=bool(args.use_hetatm) if parity else True,
+                  coherence_envelope=parity or bool(args.coherence_envelope),
+                  dose_rate_e_per_px_s=float(args.dose_rate),
+                  absolute_intensity=parity or bool(args.absolute_intensity),
+                  cistem_dqe=parity or bool(args.cistem_dqe))
     run(cfg, args.pdb, args.output)
 if __name__ == '__main__':
     main()
