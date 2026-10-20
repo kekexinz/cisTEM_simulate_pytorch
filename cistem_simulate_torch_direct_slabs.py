@@ -549,6 +549,7 @@ class SimConfig:
     absolute_intensity: bool = False
     cistem_dqe: bool = False
     cistem_hydration_neighborhood: bool = False
+    cistem_exact_whitening: bool = False
 
 def electron_wavelength_angstrom(kv: float) -> float:
     return 1226.39 / math.sqrt(kv * 1000.0 + 9.7845e-07 * (kv * 1000.0) ** 2) * 0.01
@@ -2880,6 +2881,15 @@ def _cistem_inelastic_lorentzian_filter_full_torch(shape: Tuple[int, int], pixel
     store[key] = filt
     return filt
 
+def _cistem_lorentzian_from_k2(frequency_squared: torch.Tensor) -> torch.Tensor:
+    # same empirical expression (and C++ operator precedence) as _cistem_inelastic_lorentzian_filter_full_torch
+    frequency = torch.sqrt(torch.clamp(frequency_squared, min=0.0))
+    p1, p2, p3, q1, q2, q3 = 0.8235, 47.4, 1.0, 2334.0, 39.22, 1.001
+    num = p1 * frequency_squared + p2 * frequency + p3
+    den = frequency_squared * frequency + q1 * frequency_squared * q2 * frequency + q3
+    return (num / torch.clamp(den, min=1e-20)).to(torch.float32)
+
+
 def _cistem_whiten_inelastic_fft_full_torch(fft_img: torch.Tensor, cfg: SimConfig) -> torch.Tensor:
     """Apply cisTEM-like radial whitening to full FFTs of amplitude gratings.
 
@@ -2902,6 +2912,54 @@ def _cistem_whiten_inelastic_fft_full_torch(fft_img: torch.Tensor, cfg: SimConfi
     radial_weight = radial_weight / torch.clamp(radial_weight.max(dim=1, keepdim=True).values, min=1e-30)
     weight = radial_weight.gather(1, flat_bins[None, :].expand(m, -1)).reshape(m, ny, nx).to(torch.float32)
     return fft_img * weight
+
+def cistem_whiten_inelastic_exact_rfft_torch(fft_img: torch.Tensor) -> torch.Tensor:
+    """Exact port of WaveFunctionPropagator's whitening of the inelastic amplitude grating.
+
+    cisTEM (wave_function_propagator.cpp):
+        Curve whitening_filter; SetupXAxis(0, 0.5*sqrt(2), int((nx/2 + 1)*sqrt(2) + 1))
+        amplitude_grating.Compute1DRotationalAverage(whitening_filter, number_of_terms, true)
+        whitening_filter.SquareRoot(); Reciprocal(); MultiplyByConstant(1 / max)
+        amplitude_grating.ApplyCurveFilter(&whitening_filter)
+    On a Fourier-space image Compute1DRotationalAverage averages |F| (amplitudes, not intensities) over
+    radius in reciprocal pixels, splitting each value between the two neighbouring bins by linear weights
+    and skipping explicit Hermitian mates; ApplyCurveFilter multiplies by the curve linearly interpolated at
+    each radius. So the weight is 1/sqrt(mean |F|), normalised to a maximum of 1: a half whitening.
+    Input/output: [M, H, W//2+1] rfft2 of the per-slab amplitude gratings.
+    """
+    m, ny, nxh = fft_img.shape
+    nx = 2 * (nxh - 1)
+    device = fft_img.device
+    n_bins = int((nx / 2.0 + 1.0) * math.sqrt(2.0) + 1.0)
+    dx = 0.5 * math.sqrt(2.0) / float(n_bins - 1)
+    fy = torch.fft.fftfreq(ny, d=1.0, device=device)
+    fx = torch.fft.rfftfreq(nx, d=1.0, device=device)
+    ky, kx = torch.meshgrid(fy, fx, indexing='ij')
+    rad = torch.sqrt(kx * kx + ky * ky).reshape(-1)
+    pos = rad / dx
+    idx = torch.clamp(torch.floor(pos).long(), 0, n_bins - 1)
+    frac = (pos - idx.to(pos.dtype)).clamp(0.0, 1.0)
+    last = idx >= n_bins - 1
+    idx_n = torch.where(last, idx, idx + 1)
+    w_m = torch.where(last, torch.ones_like(frac), 1.0 - frac)
+    w_n = torch.where(last, torch.zeros_like(frac), frac)
+    # explicit Hermitian mates in the half-plane layout: the x = 0 column at negative y
+    keep = ~((kx.reshape(-1) == 0) & (ky.reshape(-1) < 0))
+    amp = fft_img.abs().reshape(m, -1).to(torch.float32)
+    sums = torch.zeros((m, n_bins), device=device, dtype=torch.float32)
+    cnt = torch.zeros((n_bins,), device=device, dtype=torch.float32)
+    km = keep.to(torch.float32)
+    sums.scatter_add_(1, idx[None, :].expand(m, -1), amp * (w_m * km)[None, :])
+    sums.scatter_add_(1, idx_n[None, :].expand(m, -1), amp * (w_n * km)[None, :])
+    cnt.scatter_add_(0, idx, w_m * km)
+    cnt.scatter_add_(0, idx_n, w_n * km)
+    avg = torch.where(cnt[None, :] != 0, sums / torch.clamp(cnt[None, :], min=1e-30), sums)
+    curve = 1.0 / torch.sqrt(avg)
+    curve = curve / curve.max(dim=1, keepdim=True).values
+    # ApplyCurveFilter: linear interpolation of the curve at every coefficient's radius
+    weight = curve.gather(1, idx[None, :].expand(m, -1)) * w_m[None, :] + curve.gather(1, idx_n[None, :].expand(m, -1)) * w_n[None, :]
+    return fft_img * weight.reshape(m, ny, nxh).to(fft_img.real.dtype)
+
 
 def cistem_filter_inelastic_amplitude_batch_torch(amp: torch.Tensor, cfg: SimConfig) -> torch.Tensor:
     """Match WaveFunctionPropagator's amplitude_grating preprocessing.
@@ -2926,6 +2984,13 @@ def cistem_filter_inelastic_amplitude_batch_torch(amp: torch.Tensor, cfg: SimCon
     mean = x.mean(dim=(-2, -1), keepdim=True)
     active = (mean > 0.001).to(torch.float32)
     scaled = x * float(_cistem_inelastic_voltage_scale(float(getattr(cfg, 'kv', 300.0))))
+    if bool(getattr(cfg, 'cistem_exact_whitening', False)):
+        fft_r = cistem_whiten_inelastic_exact_rfft_torch(torch.fft.rfft2(scaled, dim=(-2, -1)))
+        _, _, k2r = get_torch_sim_cache(cfg, x.device).rfft_grid((ny, nx), float(cfg.pixel_size))
+        lorentz_r = _cistem_lorentzian_from_k2(k2r.to(torch.float32))
+        filtered = torch.fft.irfft2(fft_r * lorentz_r[None, :, :], s=(ny, nx), dim=(-2, -1)).to(torch.float32)
+        out = filtered * active + x * (1.0 - active)
+        return out[0].contiguous() if squeeze else out.reshape(original_shape).contiguous()
     fft_amp = torch.fft.fft2(scaled, dim=(-2, -1))
     fft_amp = _cistem_whiten_inelastic_fft_full_torch(fft_amp, cfg)
     lorentz = _cistem_inelastic_lorentzian_filter_full_torch((ny, nx), float(cfg.pixel_size), x.device, cfg)
@@ -3318,6 +3383,8 @@ def parse_args(argv: Optional[Iterable[str]]=None) -> argparse.Namespace:
     parser.add_argument('--absolute-intensity', action='store_true', help='Keep absolute counts (no renormalisation to the incident dose)')
     parser.add_argument('--cistem-hydration-neighborhood', action='store_true',
                         help="With --water-soft-weight: apply the hydration curve only within cisTEM's per-atom neighbourhood cube (exclusion + shell peak, no dip)")
+    parser.add_argument('--cistem-exact-whitening', action='store_true',
+                        help="Whiten the inelastic grating exactly as cisTEM: 1/sqrt(rotational mean |F|) with its Curve binning and interpolation")
     parser.add_argument('--cistem-dqe', action='store_true', help="With --dqe: cisTEM's DQE filter (K2 fit in 1/px, whole spectrum incl. the mean); needs --absolute-intensity")
     parser.add_argument('--no-center', action='store_true')
     parser.add_argument('--rot', type=float, default=0.0)
@@ -3387,6 +3454,7 @@ def main(argv: Optional[Iterable[str]]=None) -> None:
                   absolute_intensity=parity or bool(args.absolute_intensity),
                   cistem_dqe=parity or bool(args.cistem_dqe),
                   cistem_hydration_neighborhood=parity or bool(args.cistem_hydration_neighborhood),
+                  cistem_exact_whitening=parity or bool(args.cistem_exact_whitening),
                   # cisTEM weights waters by the hydration curve and never removes them
                   water_soft_weight=True if parity else cfg.water_soft_weight,
                   water_exclude_below_a=0.0 if parity else cfg.water_exclude_below_a)
