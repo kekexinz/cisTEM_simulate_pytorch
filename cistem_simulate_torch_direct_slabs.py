@@ -2755,10 +2755,6 @@ def finalize_detector_image_torch(img: torch.Tensor, cfg: SimConfig) -> torch.Te
                 filt = dqe_filter_rfft_torch(tuple(out.shape[-2:]), cfg.pixel_size, out.device, root=True, cfg=cfg)
                 out = mean + apply_fourier_filter_real_rfft_torch(out - mean, filt)
             if cfg.poisson:
-                if cfg.seed is not None:
-                    torch.manual_seed(int(cfg.seed))
-                    if out.device.type == 'cuda':
-                        torch.cuda.manual_seed_all(int(cfg.seed))
                 out = torch.poisson(torch.clamp(out, min=0.0)).to(torch.float32)
             return out
         if cfg.dqe:
@@ -2767,10 +2763,6 @@ def finalize_detector_image_torch(img: torch.Tensor, cfg: SimConfig) -> torch.Te
             filt = dqe_filter_rfft_torch(tuple(out.shape[-2:]), cfg.pixel_size, out.device, root=True, cfg=cfg)
             out = mean + apply_fourier_filter_real_rfft_torch(contrast, filt)
         if cfg.poisson:
-            if cfg.seed is not None:
-                torch.manual_seed(int(cfg.seed))
-                if out.device.type == 'cuda':
-                    torch.cuda.manual_seed_all(int(cfg.seed))
             electrons_per_pixel = float(cfg.dose_e_per_a2) * float(cfg.pixel_size) ** 2
             mean = out.mean(dim=spatial_dims, keepdim=True)
             norm_intensity = out / (mean + 1e-12)
@@ -3303,6 +3295,12 @@ def run(cfg: SimConfig, pdb_path: str | Path, output_path: str | Path) -> np.nda
     recorder.set_meta('program_version', PROGRAM_VERSION)
     recorder.set_meta('optimization_base_sha256', OPTIMIZATION_BASE_SHA256)
     recorder.start()
+    if cfg.seed is not None:
+        # seed once per run: re-seeding in the per-frame detector step gave every frame the same shot noise
+        # (30 frames -> noise variance 30x the counts instead of 1x)
+        torch.manual_seed(int(cfg.seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(cfg.seed))
     try:
         with timing_section(cfg, 'pdb_read_and_center'):
             protein_frame_atoms = read_pdb_atoms(pdb_path, use_hydrogen=cfg.use_hydrogen, allow_hetatm=cfg.use_hetatm)
