@@ -550,6 +550,11 @@ class SimConfig:
     cistem_dqe: bool = False
     cistem_hydration_neighborhood: bool = False
     cistem_exact_whitening: bool = False
+    phase_plate_output: bool = False
+    phase_plate_shift_rad: float = 0.5 * math.pi
+    phase_plate_defocus_a: float = 0.0
+    phase_plate_cut_on_a: Optional[float] = None
+    phase_plate_dqe: bool = True
 
 def electron_wavelength_angstrom(kv: float) -> float:
     return 1226.39 / math.sqrt(kv * 1000.0 + 9.7845e-07 * (kv * 1000.0) ** 2) * 0.01
@@ -3047,6 +3052,13 @@ def cistem_complex_transfer_full_batch_torch(shape: Tuple[int, int], cfg: SimCon
     lam = electron_wavelength_angstrom(float(cfg.kv))
     cs_a = float(cfg.cs_mm) * 10000000.0
     chi = math.pi * lam * defocus * k2[None, :, :] - 0.5 * math.pi * cs_a * lam ** 3 * k2[None, :, :] ** 2 + float(cfg.phase_shift_rad)
+    pp_shift = float(getattr(cfg, 'zernike_phase_shift_rad', 0.0))
+    if pp_shift != 0.0:
+        # Zernike phase plate: the scattered waves are shifted relative to the unscattered beam. (A shift added to
+        # every frequency, as --phase-shift does, is a global phase and gives no contrast in a multislice image.)
+        cut_on = getattr(cfg, 'zernike_cut_on_a', None)
+        k_cut2 = 0.0 if cut_on is None else (1.0 / float(cut_on)) ** 2
+        chi = chi + pp_shift * (k2[None, :, :] > k_cut2).to(chi.dtype)
     h_real = -torch.cos(chi)
     h_imag = -torch.sin(chi)
     if bool(getattr(cfg, 'coherence_envelope', False)):
@@ -3170,6 +3182,16 @@ def propagate_slabs_cistem_like_torch(phase_slabs, amp_slabs, dz_list, cfg: SimC
     return propagate_slab_stack_batch_cistem_like_torch(as_slab_stack_torch(phase_slabs), as_slab_stack_torch(amp_slabs), dz_list, cfg)
 
 
+def phase_plate_config(cfg: SimConfig) -> SimConfig:
+    """Lens for the paired phase-plate image: Zernike shift, defocus at the scattering centre, no shot noise."""
+    d = float(getattr(cfg, 'phase_plate_defocus_a', 0.0))
+    pp = replace(cfg, defocus_u=d, defocus_v=None, defocus_angle_deg=0.0, phase_shift_rad=0.0, poisson=False,
+                 dqe=bool(cfg.dqe) and bool(getattr(cfg, 'phase_plate_dqe', True)))
+    pp.zernike_phase_shift_rad = float(getattr(cfg, 'phase_plate_shift_rad', 0.5 * math.pi))
+    pp.zernike_cut_on_a = getattr(cfg, 'phase_plate_cut_on_a', None)
+    return pp
+
+
 def simulate_movie_from_direct_slabs_torch(
     atoms: List[Atom],
     cfg: SimConfig,
@@ -3207,9 +3229,13 @@ def simulate_movie_from_direct_slabs_torch(
         water_cache = prepare_water_cache_torch(atoms, cfg, hydration_atlas)
     frames: List[torch.Tensor] = []
     summed: Optional[torch.Tensor] = None
+    pp_cfg: Optional[SimConfig] = None
+    pp_sum: Optional[torch.Tensor] = None
     original_total_dose = float(cfg.dose_e_per_a2)
     try:
         cfg.dose_e_per_a2 = float(dose_per_frame)
+        # built after the per-frame dose is set, so its absolute counts are per frame like the main image
+        pp_cfg = phase_plate_config(cfg) if getattr(cfg, 'phase_plate_output', False) else None
         for batch_start in range(0, n_frames, frame_batch_size):
             batch_end = min(n_frames, batch_start + frame_batch_size)
             frame_indices = list(range(batch_start, batch_end))
@@ -3234,6 +3260,13 @@ def simulate_movie_from_direct_slabs_torch(
                 else:
                     batch_sum = images.sum(dim=0).to(torch.float32)
                     summed = batch_sum if summed is None else summed + batch_sum
+            if pp_cfg is not None:
+                # same frame slabs (same water positions, same damage) through a phase-plate lens; expected counts
+                with timing_section(cfg, 'phase_plate_image'):
+                    pp = propagate_slab_stack_batch_cistem_like_torch(phase_batch, amp_batch, dz_list, pp_cfg)
+                    if pp.ndim == 2:
+                        pp = pp.unsqueeze(0)
+                    pp_sum = pp.sum(dim=0).to(torch.float32) if pp_sum is None else pp_sum + pp.sum(dim=0).to(torch.float32)
     finally:
         cfg.dose_e_per_a2 = original_total_dose
     if cfg.save_frames:
@@ -3244,6 +3277,10 @@ def simulate_movie_from_direct_slabs_torch(
         raise RuntimeError('No frames were generated')
     if cfg.normalize_frame_sum:
         summed = summed / float(n_frames)
+        if pp_sum is not None:
+            pp_sum = pp_sum / float(n_frames)
+    if pp_sum is not None:
+        cfg._phase_plate_image = pp_sum
     return summed.to(torch.float32)
 
 
@@ -3337,6 +3374,13 @@ def run(cfg: SimConfig, pdb_path: str | Path, output_path: str | Path) -> np.nda
                     )
                 else:
                     raise ValueError(f'Unknown mode: {work_cfg.mode}')
+        if getattr(work_cfg, 'phase_plate_output', False):
+            pp_img = getattr(work_cfg, '_phase_plate_image', None)
+            if pp_img is None:
+                raise ValueError('--phase-plate-output needs --per-frame (the phase-plate image is formed frame by frame)')
+            pp_np = center_crop_torch(pp_img, final_box).detach().cpu().numpy().astype(np.float32, copy=False)
+            out_p = Path(output_path)
+            save_image_or_volume(out_p.with_name(out_p.stem + '_pp' + out_p.suffix), pp_np, cfg.pixel_size)
         with timing_section(work_cfg, 'crop_and_device_to_host'):
             image_tensor = center_crop_torch(image_tensor, final_box)
             image_numpy = image_tensor.detach().cpu().numpy().astype(np.float32, copy=False)
@@ -3385,6 +3429,13 @@ def parse_args(argv: Optional[Iterable[str]]=None) -> argparse.Namespace:
                         help="With --water-soft-weight: apply the hydration curve only within cisTEM's per-atom neighbourhood cube (exclusion + shell peak, no dip)")
     parser.add_argument('--cistem-exact-whitening', action='store_true',
                         help="Whiten the inelastic grating exactly as cisTEM: 1/sqrt(rotational mean |F|) with its Curve binning and interpolation")
+    parser.add_argument('--phase-plate-output', action='store_true',
+                        help='Also write <output>_pp: the same exposure (same frame slabs, water, damage, detector) through a '
+                             'Zernike phase plate, as expected counts without shot noise. Needs --per-frame')
+    parser.add_argument('--phase-plate-shift', type=float, default=0.5, help='phase-plate shift in units of pi (default 0.5)')
+    parser.add_argument('--phase-plate-defocus', type=float, default=0.0, help='defocus of the phase-plate image, Angstrom, at the scattering centre')
+    parser.add_argument('--phase-plate-cut-on', type=float, default=None, help='cut-on of the phase plate, Angstrom (default: only the central beam)')
+    parser.add_argument('--phase-plate-no-dqe', action='store_true', help='phase-plate image without the detector DQE filter')
     parser.add_argument('--cistem-dqe', action='store_true', help="With --dqe: cisTEM's DQE filter (K2 fit in 1/px, whole spectrum incl. the mean); needs --absolute-intensity")
     parser.add_argument('--no-center', action='store_true')
     parser.add_argument('--rot', type=float, default=0.0)
@@ -3455,6 +3506,11 @@ def main(argv: Optional[Iterable[str]]=None) -> None:
                   cistem_dqe=parity or bool(args.cistem_dqe),
                   cistem_hydration_neighborhood=parity or bool(args.cistem_hydration_neighborhood),
                   cistem_exact_whitening=parity or bool(args.cistem_exact_whitening),
+                  phase_plate_output=bool(args.phase_plate_output),
+                  phase_plate_shift_rad=float(args.phase_plate_shift) * math.pi,
+                  phase_plate_defocus_a=float(args.phase_plate_defocus),
+                  phase_plate_cut_on_a=args.phase_plate_cut_on,
+                  phase_plate_dqe=not bool(args.phase_plate_no_dqe),
                   # cisTEM weights waters by the hydration curve and never removes them
                   water_soft_weight=True if parity else cfg.water_soft_weight,
                   water_exclude_below_a=0.0 if parity else cfg.water_exclude_below_a)
